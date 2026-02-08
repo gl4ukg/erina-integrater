@@ -2,7 +2,7 @@
 
 client_id = "c40c300637ffe7e5a76b6acc93fb4690"
 name = "erina-integrater"
-application_url = "https://erina-ks.com"
+application_url = "https://erina-integrater-production.up.railway.app"
 embedded = true
 
 [build]
@@ -31,4 +31,7 @@ optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = [ ]
+redirect_urls = [
+  "https://erina-integrater-production.up.railway.app/auth/callback",
+  "https://erina-integrater-production.up.railway.app/auth/shopify/callback",
+]
