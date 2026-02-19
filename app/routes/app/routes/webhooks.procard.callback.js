@@ -1,5 +1,4 @@
 import crypto from "crypto";
-import { shopify } from "../shopify.server"; // adjust path if needed
 
 const API_VERSION = "2025-01";
 
@@ -13,7 +12,6 @@ function verifyCallbackSignature(body) {
   const secret = process.env.PROCARD_SECRET;
   if (!secret) throw new Error("Missing PROCARD_SECRET");
 
-  // Docs: merchantAccount, orderReference, amount, currency, merchantSignature
   const merchant_id = String(body?.merchantAccount || "");
   const orderReference = String(body?.orderReference || "");
   const amount = normalizeAmount(body?.amount);
@@ -28,106 +26,72 @@ function verifyCallbackSignature(body) {
     .createHmac("sha512", secret)
     .update(toSign, "utf8")
     .digest("hex");
-
   return expected === merchantSignature;
 }
 
-async function getOfflineAdminGraphqlClient() {
-  const shopDomain = process.env.SHOP_DOMAIN;
-  if (!shopDomain) throw new Error("Missing SHOP_DOMAIN env var");
+async function shopifyRest(path, { method = "GET", body } = {}) {
+  const shop = process.env.SHOPIFY_STORE_DOMAIN;
+  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  if (!shop) throw new Error("Missing SHOPIFY_STORE_DOMAIN");
+  if (!token) throw new Error("Missing SHOPIFY_ADMIN_ACCESS_TOKEN");
 
-  const sessionId = `offline_${shopDomain}`;
-  const session = await shopify.sessionStorage.loadSession(sessionId);
+  const res = await fetch(`https://${shop}/admin/api/${API_VERSION}${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": token,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
 
-  if (!session) {
-    throw new Error(
-      `No offline session found for ${shopDomain}. Reinstall the app on that store to create offline session.`,
-    );
+  const text = await res.text();
+  const json = text ? JSON.parse(text) : null;
+
+  if (!res.ok) {
+    console.error("Shopify REST error", { status: res.status, json });
+    throw new Error(`Shopify REST failed: ${res.status}`);
   }
-
-  return new shopify.api.clients.Graphql({ session, apiVersion: API_VERSION });
+  return json;
 }
 
-async function findOrderByOrderNumber(admin, orderNumber) {
-  const q = `name:#${orderNumber}`;
+async function findOrderByOrderNumber(orderNumber) {
+  // Search orders by name: #1013 etc
+  const q = encodeURIComponent(`name:#${orderNumber}`);
+  const res = await shopifyRest(
+    `/orders.json?status=any&limit=1&name=${encodeURIComponent("#" + orderNumber)}`,
+  ).catch(() => null);
 
-  const result = await admin.query({
-    data: {
-      query: `
-        query FindOrder($q: String!) {
-          orders(first: 1, query: $q) {
-            nodes { id name displayFinancialStatus tags }
-          }
-        }
-      `,
-      variables: { q },
-    },
+  // fallback using /orders.json?name= is sometimes limited; safer:
+  const search = await shopifyRest(
+    `/orders.json?status=any&limit=1&fields=id,name,tags,financial_status&name=${encodeURIComponent("#" + orderNumber)}`,
+  ).catch(() => null);
+
+  const order = search?.orders?.[0] || res?.orders?.[0] || null;
+  return order;
+}
+
+async function tagOrder(orderIdNumeric, extraTags) {
+  const current = await shopifyRest(`/orders/${orderIdNumeric}.json`);
+  const tags = String(current?.order?.tags || "");
+  const nextTags = Array.from(
+    new Set([
+      ...tags
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean),
+      ...extraTags,
+    ]),
+  ).join(", ");
+
+  await shopifyRest(`/orders/${orderIdNumeric}.json`, {
+    method: "PUT",
+    body: { order: { id: orderIdNumeric, tags: nextTags } },
   });
 
-  return result?.body?.data?.orders?.nodes?.[0] || null;
+  return nextTags.split(",").map((t) => t.trim());
 }
 
-async function orderMarkAsPaid(admin, orderGid) {
-  const result = await admin.query({
-    data: {
-      query: `
-        mutation MarkPaid($input: OrderMarkAsPaidInput!) {
-          orderMarkAsPaid(input: $input) {
-            order { id displayFinancialStatus }
-            userErrors { field message }
-          }
-        }
-      `,
-      variables: { input: { id: orderGid } },
-    },
-  });
-
-  const errs = result?.body?.data?.orderMarkAsPaid?.userErrors || [];
-  if (errs.length) throw new Error(errs.map((e) => e.message).join(", "));
-}
-
-async function orderUpdateTags(admin, orderGid, tags) {
-  const result = await admin.query({
-    data: {
-      query: `
-        mutation UpdateOrder($input: OrderInput!) {
-          orderUpdate(input: $input) {
-            order { id tags }
-            userErrors { field message }
-          }
-        }
-      `,
-      variables: { input: { id: orderGid, tags } },
-    },
-  });
-
-  const errs = result?.body?.data?.orderUpdate?.userErrors || [];
-  if (errs.length) throw new Error(errs.map((e) => e.message).join(", "));
-}
-
-async function fetchFullOrderJSONByGid(orderGid) {
-  const shopDomain = process.env.SHOP_DOMAIN;
-  if (!shopDomain) throw new Error("Missing SHOP_DOMAIN env var");
-
-  const sessionId = `offline_${shopDomain}`;
-  const session = await shopify.sessionStorage.loadSession(sessionId);
-  if (!session) throw new Error("Missing offline session");
-
-  const numericId = String(orderGid).split("/").pop();
-
-  const res = await fetch(
-    `https://${shopDomain}/admin/api/${API_VERSION}/orders/${numericId}.json`,
-    {
-      method: "GET",
-      headers: { "X-Shopify-Access-Token": session.accessToken },
-    },
-  );
-
-  const json = await res.json().catch(() => null);
-  return json?.order || null;
-}
-
-/* ---- POST OFFICE (bulk insert): keep your exact existing functions ---- */
+/* ---- PostOffice (same logic as you had) ---- */
 function normalizeCityLabel(city) {
   if (!city) return "";
   return String(city).trim();
@@ -175,6 +139,7 @@ function countryIdFromShippingAddress(shippingAddress) {
     code === "MACEDONIA"
   )
     return 3;
+
   return 1;
 }
 
@@ -183,12 +148,12 @@ function parseNumberOr(value, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function getOrderPriceFromPayload(payload) {
+function getOrderPriceFromPayload(order) {
   const candidates = [
-    payload?.current_total_price,
-    payload?.total_price,
-    payload?.current_total_price_set?.shop_money?.amount,
-    payload?.total_price_set?.shop_money?.amount,
+    order?.current_total_price,
+    order?.total_price,
+    order?.current_total_price_set?.shop_money?.amount,
+    order?.total_price_set?.shop_money?.amount,
   ];
   for (const c of candidates) {
     const n = Number(c);
@@ -197,7 +162,7 @@ function getOrderPriceFromPayload(payload) {
   return 0;
 }
 
-async function sendToPostOffice(orderPayload) {
+async function sendToPostOffice(order) {
   const baseUrl = process.env.POSTOFFICE_BASE_URL;
   const token = process.env.POSTOFFICE_TOKEN;
   const bulkInsertPath =
@@ -206,7 +171,8 @@ async function sendToPostOffice(orderPayload) {
   if (!baseUrl) throw new Error("Missing POSTOFFICE_BASE_URL");
   if (!token) throw new Error("Missing POSTOFFICE_TOKEN");
 
-  const shipping = orderPayload?.shipping_address;
+  const shipping = order?.shipping_address;
+
   if (
     !shipping?.address1 ||
     !shipping?.city ||
@@ -214,11 +180,17 @@ async function sendToPostOffice(orderPayload) {
     !shipping?.last_name
   ) {
     console.error("Skipping PostOffice: missing shipping fields", {
-      orderId: orderPayload?.id,
-      orderNumber: orderPayload?.order_number,
+      orderId: order?.id,
+      orderNumber: order?.order_number,
     });
     return;
   }
+
+  const firstName = shipping?.first_name || "";
+  const lastName = shipping?.last_name || "";
+  const address = shipping?.address1 || "";
+  const addressDetails = shipping?.address2 || "";
+  const phone = shipping?.phone || order?.phone || "";
 
   const cityLabel = normalizeCityLabel(shipping?.city);
   const countryId = countryIdFromShippingAddress(shipping);
@@ -228,15 +200,23 @@ async function sendToPostOffice(orderPayload) {
   const height = parseNumberOr(process.env.POSTOFFICE_DEFAULT_HEIGHT_CM, 20);
   const weight = parseNumberOr(process.env.POSTOFFICE_DEFAULT_WEIGHT_KG, 1);
 
-  const orderPrice = getOrderPriceFromPayload(orderPayload);
+  const orderPrice = getOrderPriceFromPayload(order);
+  const orderDescription = order?.note || "";
+  const packageDescription = (order?.line_items || [])
+    .map((li) => `${li?.title ?? ""} x${li?.quantity ?? 1}`.trim())
+    .filter(Boolean)
+    .join(", ");
+
+  const refid = String(order?.order_number || order?.name || order?.id || "");
+  const ordersRealPrice = orderPrice;
 
   const body = [
     {
-      FirstName: shipping?.first_name || "",
-      LastName: shipping?.last_name || "",
-      Address: shipping?.address1 || "",
-      AddressDetails: shipping?.address2 || undefined,
-      Phone: shipping?.phone || orderPayload?.phone || "",
+      FirstName: firstName,
+      LastName: lastName,
+      Address: address,
+      AddressDetails: addressDetails || undefined,
+      Phone: phone,
       Width: width,
       Length: length,
       Height: height,
@@ -247,25 +227,15 @@ async function sendToPostOffice(orderPayload) {
       Exchangeable: true,
       Invoice: false,
       OrderPrice: orderPrice,
-      OrderDescription: orderPayload?.note || undefined,
-      PackageDescription:
-        (orderPayload?.line_items || [])
-          .map((li) => `${li?.title ?? ""} x${li?.quantity ?? 1}`.trim())
-          .filter(Boolean)
-          .join(", ") || undefined,
-      Refid:
-        String(
-          orderPayload?.order_number ||
-            orderPayload?.name ||
-            orderPayload?.id ||
-            "",
-        ) || undefined,
+      OrderDescription: orderDescription || undefined,
+      PackageDescription: packageDescription || undefined,
+      Refid: refid || undefined,
       SectionId: -1,
       SellerId: -1,
       UserId: -1,
       CountryId: countryId,
       CityLabel: cityLabel,
-      OrdersRealPrice: orderPrice,
+      OrdersRealPrice: ordersRealPrice,
     },
   ];
 
@@ -288,6 +258,7 @@ async function sendToPostOffice(orderPayload) {
     });
     throw new Error(errorText || "PostOffice bulk-insert failed");
   }
+
   await res.text();
 }
 
@@ -295,9 +266,8 @@ export const action = async ({ request }) => {
   const body = await request.json().catch(() => null);
   if (!body) return new Response("Bad JSON", { status: 400 });
 
-  if (!verifyCallbackSignature(body)) {
+  if (!verifyCallbackSignature(body))
     return new Response("Invalid signature", { status: 401 });
-  }
 
   const status = String(body?.transactionStatus || "");
   const orderRef = String(body?.orderReference || "");
@@ -306,28 +276,18 @@ export const action = async ({ request }) => {
   try {
     if (status !== "Approved") return new Response("OK", { status: 200 });
 
-    const admin = await getOfflineAdminGraphqlClient();
-
-    const order = await findOrderByOrderNumber(admin, orderRef);
+    const order = await findOrderByOrderNumber(orderRef);
     if (!order?.id) return new Response("Order not found", { status: 404 });
 
-    const tags = Array.isArray(order.tags) ? order.tags : [];
-    const alreadySentToPost = tags.includes("sent_to_postoffice");
-    const alreadyPaid =
-      String(order.displayFinancialStatus || "").toUpperCase() === "PAID";
+    const tags = await tagOrder(Number(order.id), ["paid_procard"]);
 
-    if (!alreadyPaid) {
-      await orderMarkAsPaid(admin, order.id);
-    }
-
-    if (!alreadySentToPost) {
-      const fullOrder = await fetchFullOrderJSONByGid(order.id);
+    const alreadySent = tags.includes("sent_to_postoffice");
+    if (!alreadySent) {
+      const full = await shopifyRest(`/orders/${order.id}.json`);
+      const fullOrder = full?.order;
       if (fullOrder) {
         await sendToPostOffice(fullOrder);
-        const nextTags = Array.from(
-          new Set([...tags, "sent_to_postoffice", "paid_procard"]),
-        );
-        await orderUpdateTags(admin, order.id, nextTags);
+        await tagOrder(Number(order.id), ["sent_to_postoffice"]);
       }
     }
 
