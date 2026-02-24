@@ -165,8 +165,9 @@ async function sendInvoiceEmail(orderIdNumeric) {
 }
 
 export const action = async ({ request }) => {
-  const { topic, payload } = await authenticate.webhook(request);
+  console.log([...request.headers]);
   console.log("HIT /webhooks/orders_create/procard");
+  const { topic, payload } = await authenticate.webhook(request);
 
   if (topic !== "ORDERS_CREATE") return new Response(null, { status: 200 });
   if (!isManualPayment(payload)) return new Response(null, { status: 200 });
