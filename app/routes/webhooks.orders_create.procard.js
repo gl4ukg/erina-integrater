@@ -2,8 +2,54 @@ import { authenticate } from "../shopify.server";
 import crypto from "crypto";
 
 const API_VERSION = "2025-01";
-const CURRENCY_ISO_NUMERIC = 978; // EUR
+const CURRENCY_ISO_NUMERIC = 978;
 
+// --- TOKEN (Client Credentials Grant) ---
+let _cachedToken = null;
+let _cachedTokenExpMs = 0;
+
+async function getAdminAccessToken() {
+  const shop = process.env.SHOPIFY_STORE_DOMAIN;
+  const clientId = process.env.SHOPIFY_API_KEY;
+  const clientSecret = process.env.SHOPIFY_API_SECRET;
+
+  if (!shop) throw new Error("Missing SHOPIFY_STORE_DOMAIN");
+  if (!clientId) throw new Error("Missing SHOPIFY_API_KEY");
+  if (!clientSecret) throw new Error("Missing SHOPIFY_API_SECRET");
+
+  // cache (me buffer 60s)
+  const now = Date.now();
+  if (_cachedToken && now < _cachedTokenExpMs - 60_000) return _cachedToken;
+
+  // Shopify client credentials grant
+  const res = await fetch(`https://${shop}/admin/oauth/access_token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: clientId,
+      client_secret: clientSecret,
+      grant_type: "client_credentials",
+    }),
+  });
+
+  const json = await res.json().catch(() => null);
+
+  if (!res.ok || !json?.access_token) {
+    console.error("Token generation failed", { status: res.status, json });
+    throw new Error("Failed to generate admin access token");
+  }
+
+  _cachedToken = json.access_token;
+
+  // Shopify zakonisht kthen expires_in (sekonda). Nëse s’vjen, e lëmë 1 orë.
+  const expiresInSec = Number(json.expires_in);
+  _cachedTokenExpMs =
+    now + (Number.isFinite(expiresInSec) ? expiresInSec * 1000 : 3600_000);
+
+  return _cachedToken;
+}
+
+// --- your existing helpers ---
 function normalizeAmount(amount) {
   const n = Number(amount);
   if (!Number.isFinite(n)) return "0";
@@ -19,10 +65,8 @@ function makeRequestSignature({
 }) {
   const secret = process.env.PROCARD_SECRET;
   if (!secret) throw new Error("Missing PROCARD_SECRET");
-
   const amt = normalizeAmount(amount);
   const toSign = `${merchant_id};${order_id};${amt};${currency_iso};${description}`;
-
   return crypto
     .createHmac("sha512", secret)
     .update(toSign, "utf8")
@@ -50,12 +94,11 @@ function isManualPayment(payload) {
   return names.includes("manual");
 }
 
-async function shopifyRest(path, method, body) {
+async function shopifyRest(path, { method = "GET", body } = {}) {
   const shop = process.env.SHOPIFY_STORE_DOMAIN;
-  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-
   if (!shop) throw new Error("Missing SHOPIFY_STORE_DOMAIN");
-  if (!token) throw new Error("Missing SHOPIFY_ADMIN_ACCESS_TOKEN");
+
+  const token = await getAdminAccessToken();
 
   const res = await fetch(`https://${shop}/admin/api/${API_VERSION}${path}`, {
     method,
@@ -66,106 +109,71 @@ async function shopifyRest(path, method, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
 
-  const json = await res.json().catch(() => null);
+  const text = await res.text();
+  const json = text ? JSON.parse(text) : null;
+
   if (!res.ok) {
     console.error("Shopify REST error", { status: res.status, json });
-    throw new Error("Shopify REST failed");
+    throw new Error(`Shopify REST failed: ${res.status}`);
   }
+
   return json;
 }
 
-async function shopifyGraphQL(query, variables) {
-  const shop = process.env.SHOPIFY_STORE_DOMAIN;
-  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+async function updateOrder(orderIdNumeric, paymentUrl) {
+  const current = await shopifyRest(`/orders/${orderIdNumeric}.json`);
+  const order = current?.order;
 
-  if (!shop) throw new Error("Missing SHOPIFY_STORE_DOMAIN");
-  if (!token) throw new Error("Missing SHOPIFY_ADMIN_ACCESS_TOKEN");
+  const existing = Array.isArray(order?.note_attributes)
+    ? order.note_attributes
+    : [];
+  const filtered = existing.filter((a) => a?.name !== "procard_payment_url");
 
-  const res = await fetch(
-    `https://${shop}/admin/api/${API_VERSION}/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": token,
-      },
-      body: JSON.stringify({ query, variables }),
-    },
-  );
-
-  const json = await res.json();
-  if (!res.ok || json.errors) {
-    console.error("Shopify GraphQL error", { status: res.status, json });
-    throw new Error("Shopify GraphQL failed");
-  }
-  return json.data;
-}
-
-async function addPaymentUrlNoteAttribute(orderIdNumeric, paymentUrl) {
-  const query = `
-    query GetOrder($id: ID!) {
-      order(id: $id) {
-        id
-        tags
-        noteAttributes { name value }
-      }
-    }
-  `;
-  const mutation = `
-    mutation UpdateOrder($input: OrderInput!) {
-      orderUpdate(input: $input) {
-        order { id tags noteAttributes { name value } }
-        userErrors { field message }
-      }
-    }
-  `;
-
-  const gid = `gid://shopify/Order/${Number(orderIdNumeric)}`;
-
-  const existing = await shopifyGraphQL(query, { id: gid });
-  const tags = existing?.order?.tags || [];
-  const nextTags = Array.from(new Set([...tags, "procard_link_sent"]));
-
-  const noteAttributes = existing?.order?.noteAttributes || [];
-  const filtered = noteAttributes.filter(
-    (a) => a?.name !== "procard_payment_url",
-  );
-  const nextNoteAttributes = [
+  const note_attributes = [
     ...filtered,
-    { name: "procard_payment_url", value: String(paymentUrl) },
+    { name: "procard_payment_url", value: paymentUrl },
   ];
 
-  const data = await shopifyGraphQL(mutation, {
-    input: { id: gid, tags: nextTags, noteAttributes: nextNoteAttributes },
-  });
+  const tags = String(order?.tags || "");
+  const nextTags = Array.from(
+    new Set(
+      tags
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean)
+        .concat(["procard_link_sent"]),
+    ),
+  ).join(", ");
 
-  const errs = data?.orderUpdate?.userErrors || [];
-  if (errs.length) throw new Error(errs.map((e) => e.message).join(", "));
+  await shopifyRest(`/orders/${orderIdNumeric}.json`, {
+    method: "PUT",
+    body: {
+      order: {
+        id: orderIdNumeric,
+        tags: nextTags,
+        note_attributes,
+      },
+    },
+  });
 }
 
 async function sendInvoiceEmail(orderIdNumeric) {
-  // This triggers the "Order invoice" notification template
-  await shopifyRest(
-    `/orders/${Number(orderIdNumeric)}/send_invoice.json`,
-    "POST",
-    {
-      invoice: {
-        // optional fields:
-        // subject: "Linku për pagesë",
-        // custom_message: "Kliko butonin për të paguar me kartelë."
-      },
-    },
-  );
+  await shopifyRest(`/orders/${orderIdNumeric}/send_invoice.json`, {
+    method: "POST",
+    body: { invoice: {} },
+  });
 }
 
 export const action = async ({ request }) => {
   const { topic, payload } = await authenticate.webhook(request);
+  console.log("HIT /webhooks/orders_create/procard");
 
   if (topic !== "ORDERS_CREATE") return new Response(null, { status: 200 });
   if (!isManualPayment(payload)) return new Response(null, { status: 200 });
 
   const dispatcherUrl = process.env.PROCARD_DISPATCHER_URL;
   const merchant_id = process.env.PROCARD_MERCHANT_ID;
+
   if (!dispatcherUrl)
     return new Response("Missing PROCARD_DISPATCHER_URL", { status: 500 });
   if (!merchant_id)
@@ -181,6 +189,7 @@ export const action = async ({ request }) => {
   const approve_url = process.env.PROCARD_APPROVE_URL;
   const decline_url = process.env.PROCARD_DECLINE_URL;
   const cancel_url = process.env.PROCARD_CANCEL_URL;
+
   if (!callback_url || !approve_url || !decline_url || !cancel_url) {
     return new Response("Missing PROCARD_*_URL env vars", { status: 500 });
   }
@@ -221,34 +230,34 @@ export const action = async ({ request }) => {
     description: reqBody.description,
   });
 
-  const res = await fetch(dispatcherUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(reqBody),
-  });
+  try {
+    const res = await fetch(dispatcherUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(reqBody),
+    });
 
-  const json = await res.json().catch(() => null);
-  if (!res.ok || json?.result !== 0 || !json?.url) {
-    console.error("Dispatcher failed", { status: res.status, json });
-    return new Response("Dispatcher error", { status: 502 });
+    const json = await res.json().catch(() => null);
+
+    if (!res.ok) {
+      console.error("Dispatcher error", { status: res.status, json });
+      return new Response("Dispatcher error", { status: 502 });
+    }
+
+    if (json?.result !== 0 || !json?.url) {
+      console.error("Unexpected dispatcher response", json);
+      return new Response("Bad dispatcher response", { status: 502 });
+    }
+
+    const paymentUrl = String(json.url);
+
+    const orderIdNumeric = Number(payload?.id);
+    await updateOrder(orderIdNumeric, paymentUrl);
+    await sendInvoiceEmail(orderIdNumeric);
+
+    return new Response(null, { status: 200 });
+  } catch (e) {
+    console.error("Create payment link failed", e);
+    return new Response("Create payment link failed", { status: 502 });
   }
-
-  const paymentUrl = String(json.url);
-
-  // IMPORTANT: use numeric order id from payload.id (Shopify webhooks use numeric)
-  const orderIdNumeric = Number(payload?.id);
-
-  await addPaymentUrlNoteAttribute(orderIdNumeric, paymentUrl);
-
-  // This is what will use your "Order invoice" template with the button
-  await sendInvoiceEmail(orderIdNumeric);
-
-  console.log(
-    "ORDERS_CREATE HIT",
-    payload?.id,
-    payload?.name,
-    payload?.payment_gateway_names,
-  );
-
-  return new Response(null, { status: 200 });
 };
