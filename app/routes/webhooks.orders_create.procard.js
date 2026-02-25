@@ -210,7 +210,8 @@ export const action = async ({ request }) => {
     merchant_id,
     order_id: orderRef,
     amount: Number(normalizeAmount(amount)),
-    currency_iso: String(CURRENCY_ISO_NUMERIC),
+    currency_iso: "EUR",
+    // currency_iso: String(CURRENCY_ISO_NUMERIC),
     description,
     add_params: {
       shopifyOrderId: String(payload?.id || ""),
