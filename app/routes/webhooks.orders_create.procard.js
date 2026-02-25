@@ -186,11 +186,15 @@ export const action = async ({ request }) => {
   if (!merchant_id)
     return new Response("Missing PROCARD_MERCHANT_ID", { status: 500 });
 
-  const orderRef = String(
-    payload?.order_number || payload?.name || payload?.id || "",
-  );
+  const orderRef = String(payload?.id || "");
   const amount = getOrderTotal(payload);
   const description = `Erina Home ${orderRef}`;
+
+  console.log("ORDER", {
+    orderId: payload?.id,
+    orderNumber: payload?.order_number,
+    currency: payload?.currency,
+  });
 
   const callback_url = process.env.PROCARD_CALLBACK_URL;
   const approve_url = process.env.PROCARD_APPROVE_URL;
@@ -246,14 +250,17 @@ export const action = async ({ request }) => {
 
     const json = await res.json().catch(() => null);
 
+    console.log("DISPATCHER", { status: res.status, json });
     if (!res.ok) {
       console.error("Dispatcher error", { status: res.status, json });
       return new Response("Dispatcher error", { status: 502 });
     }
 
     if (json?.result !== 0 || !json?.url) {
-      console.error("Unexpected dispatcher response", json);
-      return new Response("Bad dispatcher response", { status: 502 });
+      console.error("Dispatcher rejected", json);
+      return new Response("OK", { status: 200 });
+      // console.error("Unexpected dispatcher response", json);
+      // return new Response("Bad dispatcher response", { status: 502 });
     }
 
     const paymentUrl = String(json.url);
@@ -261,7 +268,7 @@ export const action = async ({ request }) => {
     const orderIdNumeric = Number(payload?.id);
     await updateOrder(orderIdNumeric, paymentUrl);
     await sendInvoiceEmail(orderIdNumeric);
-
+    console.log("UPDATED_ORDER", { orderIdNumeric, paymentUrl });
     return new Response(null, { status: 200 });
   } catch (e) {
     console.error("Create payment link failed", e);
