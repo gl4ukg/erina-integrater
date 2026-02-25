@@ -23,6 +23,10 @@ api_version = "2026-01"
   topics = [ "orders/fulfilled" ]
   uri = "/webhooks/orders/fulfilled"
 
+  [[webhooks.subscriptions]]
+  topics = ["orders/create"]
+  uri = "/webhooks/orders_create/procard"
+
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "read_orders,write_orders,read_products,read_customers"
