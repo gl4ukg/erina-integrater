@@ -162,16 +162,43 @@ async function updateOrder(orderIdNumeric, paymentUrl) {
   });
 }
 
-async function sendInvoiceEmail(orderIdNumeric) {
-  await shopifyRest(`/orders/${orderIdNumeric}/send_invoice.json`, {
-    method: "POST",
-    body: { invoice: {} },
-  });
+// async function sendInvoiceEmail(orderIdNumeric) {
+//   await shopifyRest(`/orders/${orderIdNumeric}/send_invoice.json`, {
+//     method: "POST",
+//     body: { invoice: {} },
+//   });
+// }
+async function sendInvoiceEmail(shop, accessToken, orderIdNumeric) {
+  const res = await fetch(
+    `https://${shop}/admin/api/${API_VERSION}/orders/${orderIdNumeric}/send_invoice.json`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "X-Shopify-Access-Token": accessToken,
+      },
+      body: JSON.stringify({ invoice: {} }),
+    },
+  );
+
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {}
+
+  if (!res.ok) {
+    console.error("send_invoice failed", { status: res.status, text, json });
+    throw new Error(`send_invoice failed: ${res.status}`);
+  }
+
+  return json;
 }
 
 export const action = async ({ request }) => {
-  const { topic, payload } = await authenticate.webhook(request);
-
+  const { topic, payload, admin, session } =
+    await authenticate.webhook(request);
   console.log("topic:", topic);
   console.log("payment_gateway_names:", payload?.payment_gateway_names);
 
@@ -268,7 +295,11 @@ export const action = async ({ request }) => {
 
     const orderIdNumeric = Number(payload?.id);
     await updateOrder(orderIdNumeric, paymentUrl);
-    await sendInvoiceEmail(orderIdNumeric);
+
+    const shop = session.shop; // p.sh. "erina-ks.com"
+    const accessToken = session.accessToken;
+
+    await sendInvoiceEmail(shop, accessToken, orderIdNumeric);
     console.log("UPDATED_ORDER", { orderIdNumeric, paymentUrl });
     return new Response(null, { status: 200 });
   } catch (e) {
