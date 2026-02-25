@@ -91,7 +91,12 @@ function isManualPayment(payload) {
   const names = (payload?.payment_gateway_names || []).map((x) =>
     String(x || "").toLowerCase(),
   );
-  return names.includes("manual");
+
+  return (
+    names.includes("manual") ||
+    names.includes("pay by card (email)") || // <- kjo
+    names.includes("pay by card") // <- opsionale
+  );
 }
 
 async function shopifyRest(path, { method = "GET", body } = {}) {
@@ -165,9 +170,10 @@ async function sendInvoiceEmail(orderIdNumeric) {
 }
 
 export const action = async ({ request }) => {
-  console.log([...request.headers]);
-  console.log("HIT /webhooks/orders_create/procard");
   const { topic, payload } = await authenticate.webhook(request);
+
+  console.log("topic:", topic);
+  console.log("payment_gateway_names:", payload?.payment_gateway_names);
 
   if (topic !== "ORDERS_CREATE") return new Response(null, { status: 200 });
   if (!isManualPayment(payload)) return new Response(null, { status: 200 });
