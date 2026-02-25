@@ -1,55 +1,24 @@
 import { authenticate } from "../shopify.server";
+import prisma from "../db.server";
 import crypto from "crypto";
 
 const API_VERSION = "2025-01";
-const CURRENCY_ISO_NUMERIC = 978;
 
-// --- TOKEN (Client Credentials Grant) ---
-let _cachedToken = null;
-let _cachedTokenExpMs = 0;
+/* ---------------- TOKEN (Offline Session) ---------------- */
 
-async function getAdminAccessToken() {
-  const shop = process.env.SHOPIFY_STORE_DOMAIN;
-  const clientId = process.env.SHOPIFY_API_KEY;
-  const clientSecret = process.env.SHOPIFY_API_SECRET;
+async function getOfflineAccessToken(shop) {
+  const offlineId = `offline_${shop}`;
 
-  if (!shop) throw new Error("Missing SHOPIFY_STORE_DOMAIN");
-  if (!clientId) throw new Error("Missing SHOPIFY_API_KEY");
-  if (!clientSecret) throw new Error("Missing SHOPIFY_API_SECRET");
-
-  // cache (me buffer 60s)
-  const now = Date.now();
-  if (_cachedToken && now < _cachedTokenExpMs - 60_000) return _cachedToken;
-
-  // Shopify client credentials grant
-  const res = await fetch(`https://${shop}/admin/oauth/access_token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      client_id: clientId,
-      client_secret: clientSecret,
-      grant_type: "client_credentials",
-    }),
+  const session = await prisma.session.findUnique({
+    where: { id: offlineId },
+    select: { accessToken: true },
   });
 
-  const json = await res.json().catch(() => null);
-
-  if (!res.ok || !json?.access_token) {
-    console.error("Token generation failed", { status: res.status, json });
-    throw new Error("Failed to generate admin access token");
-  }
-
-  _cachedToken = json.access_token;
-
-  // Shopify zakonisht kthen expires_in (sekonda). Nëse s’vjen, e lëmë 1 orë.
-  const expiresInSec = Number(json.expires_in);
-  _cachedTokenExpMs =
-    now + (Number.isFinite(expiresInSec) ? expiresInSec * 1000 : 3600_000);
-
-  return _cachedToken;
+  return session?.accessToken || null;
 }
 
-// --- your existing helpers ---
+/* ---------------- HELPERS ---------------- */
+
 function normalizeAmount(amount) {
   const n = Number(amount);
   if (!Number.isFinite(n)) return "0";
@@ -65,8 +34,10 @@ function makeRequestSignature({
 }) {
   const secret = process.env.PROCARD_SECRET;
   if (!secret) throw new Error("Missing PROCARD_SECRET");
+
   const amt = normalizeAmount(amount);
   const toSign = `${merchant_id};${order_id};${amt};${currency_iso};${description}`;
+
   return crypto
     .createHmac("sha512", secret)
     .update(toSign, "utf8")
@@ -92,46 +63,55 @@ function isManualPayment(payload) {
     String(x || "").toLowerCase(),
   );
 
-  return (
-    names.includes("manual") ||
-    names.includes("pay by card (email)") || // <- kjo
-    names.includes("pay by card") // <- opsionale
-  );
+  return names.includes("pay by card (email)") || names.includes("manual");
 }
 
-async function shopifyRest(path, { method = "GET", body } = {}) {
-  const shop = process.env.SHOPIFY_STORE_DOMAIN;
-  if (!shop) throw new Error("Missing SHOPIFY_STORE_DOMAIN");
+/* ---------------- SHOPIFY REST ---------------- */
 
-  const token = await getAdminAccessToken();
-
+async function shopifyRest(
+  shop,
+  accessToken,
+  path,
+  { method = "GET", body } = {},
+) {
   const res = await fetch(`https://${shop}/admin/api/${API_VERSION}${path}`, {
     method,
     headers: {
       "Content-Type": "application/json",
-      "X-Shopify-Access-Token": token,
+      "X-Shopify-Access-Token": accessToken,
     },
     body: body ? JSON.stringify(body) : undefined,
   });
 
   const text = await res.text();
-  const json = text ? JSON.parse(text) : null;
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {}
 
   if (!res.ok) {
-    console.error("Shopify REST error", { status: res.status, json });
+    console.error("Shopify REST error", { status: res.status, text, json });
     throw new Error(`Shopify REST failed: ${res.status}`);
   }
 
   return json;
 }
 
-async function updateOrder(orderIdNumeric, paymentUrl) {
-  const current = await shopifyRest(`/orders/${orderIdNumeric}.json`);
+/* ---------------- UPDATE ORDER ---------------- */
+
+async function updateOrder(shop, accessToken, orderIdNumeric, paymentUrl) {
+  const current = await shopifyRest(
+    shop,
+    accessToken,
+    `/orders/${orderIdNumeric}.json`,
+  );
+
   const order = current?.order;
 
   const existing = Array.isArray(order?.note_attributes)
     ? order.note_attributes
     : [];
+
   const filtered = existing.filter((a) => a?.name !== "procard_payment_url");
 
   const note_attributes = [
@@ -140,6 +120,7 @@ async function updateOrder(orderIdNumeric, paymentUrl) {
   ];
 
   const tags = String(order?.tags || "");
+
   const nextTags = Array.from(
     new Set(
       tags
@@ -150,7 +131,7 @@ async function updateOrder(orderIdNumeric, paymentUrl) {
     ),
   ).join(", ");
 
-  await shopifyRest(`/orders/${orderIdNumeric}.json`, {
+  await shopifyRest(shop, accessToken, `/orders/${orderIdNumeric}.json`, {
     method: "PUT",
     body: {
       order: {
@@ -162,114 +143,77 @@ async function updateOrder(orderIdNumeric, paymentUrl) {
   });
 }
 
-// async function sendInvoiceEmail(orderIdNumeric) {
-//   await shopifyRest(`/orders/${orderIdNumeric}/send_invoice.json`, {
-//     method: "POST",
-//     body: { invoice: {} },
-//   });
-// }
+/* ---------------- SEND INVOICE EMAIL ---------------- */
+
 async function sendInvoiceEmail(shop, accessToken, orderIdNumeric) {
-  const res = await fetch(
-    `https://${shop}/admin/api/${API_VERSION}/orders/${orderIdNumeric}/send_invoice.json`,
+  await shopifyRest(
+    shop,
+    accessToken,
+    `/orders/${orderIdNumeric}/send_invoice.json`,
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "X-Shopify-Access-Token": accessToken,
-      },
-      body: JSON.stringify({ invoice: {} }),
+      body: { invoice: {} },
     },
   );
-
-  const text = await res.text();
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {}
-
-  if (!res.ok) {
-    console.error("send_invoice failed", { status: res.status, text, json });
-    throw new Error(`send_invoice failed: ${res.status}`);
-  }
-
-  return json;
 }
 
+/* ---------------- MAIN ACTION ---------------- */
+
 export const action = async ({ request }) => {
-  const { topic, payload, admin, session } =
-    await authenticate.webhook(request);
-  console.log("topic:", topic);
-  console.log("payment_gateway_names:", payload?.payment_gateway_names);
+  const { topic, payload } = await authenticate.webhook(request);
 
-  if (topic !== "ORDERS_CREATE") return new Response(null, { status: 200 });
-  if (!isManualPayment(payload)) return new Response(null, { status: 200 });
+  console.log("WEBHOOK HIT:", topic);
 
-  const dispatcherUrl = process.env.PROCARD_DISPATCHER_URL;
-  const merchant_id = process.env.PROCARD_MERCHANT_ID;
-
-  if (!dispatcherUrl)
-    return new Response("Missing PROCARD_DISPATCHER_URL", { status: 500 });
-  if (!merchant_id)
-    return new Response("Missing PROCARD_MERCHANT_ID", { status: 500 });
-
-  const orderRef = String(payload?.id || "");
-  const amount = getOrderTotal(payload);
-  const description = `Erina Home ${orderRef}`;
-
-  console.log("ORDER", {
-    orderId: payload?.id,
-    orderNumber: payload?.order_number,
-    currency: payload?.currency,
-  });
-
-  const callback_url = process.env.PROCARD_CALLBACK_URL;
-  const approve_url = process.env.PROCARD_APPROVE_URL;
-  const decline_url = process.env.PROCARD_DECLINE_URL;
-  const cancel_url = process.env.PROCARD_CANCEL_URL;
-
-  if (!callback_url || !approve_url || !decline_url || !cancel_url) {
-    return new Response("Missing PROCARD_*_URL env vars", { status: 500 });
+  if (topic !== "ORDERS_CREATE") {
+    return new Response(null, { status: 200 });
   }
 
-  const reqBody = {
-    operation: "Purchase",
-    merchant_id,
-    order_id: orderRef,
-    amount: Number(normalizeAmount(amount)),
-    currency_iso: "EUR",
-    // currency_iso: String(CURRENCY_ISO_NUMERIC),
-    description,
-    add_params: {
-      shopifyOrderId: String(payload?.id || ""),
-      shopifyOrderName: String(payload?.name || ""),
-    },
-    approve_url,
-    decline_url,
-    cancel_url,
-    callback_url,
-    redirect: 0,
-    client_first_name:
-      payload?.shipping_address?.first_name ||
-      payload?.customer?.first_name ||
-      "",
-    client_last_name:
-      payload?.shipping_address?.last_name ||
-      payload?.customer?.last_name ||
-      "",
-    email: payload?.email || "",
-    phone: payload?.phone || payload?.shipping_address?.phone || "",
-  };
+  if (!isManualPayment(payload)) {
+    console.log("Not manual payment → skip");
+    return new Response(null, { status: 200 });
+  }
 
-  reqBody.signature = makeRequestSignature({
-    merchant_id: reqBody.merchant_id,
-    order_id: reqBody.order_id,
-    amount: reqBody.amount,
-    currency_iso: reqBody.currency_iso,
-    description: reqBody.description,
-  });
+  const shop = request.headers.get("x-shopify-shop-domain");
+  console.log("SHOP:", shop);
 
   try {
+    const accessToken = await getOfflineAccessToken(shop);
+
+    if (!accessToken) {
+      console.error("No offline token for shop:", shop);
+      return new Response(null, { status: 200 });
+    }
+
+    const dispatcherUrl = process.env.PROCARD_DISPATCHER_URL;
+    const merchant_id = process.env.PROCARD_MERCHANT_ID;
+
+    const orderRef = String(payload?.id || "");
+    const amount = getOrderTotal(payload);
+    const description = `Erina Home ${orderRef}`;
+
+    const reqBody = {
+      operation: "Purchase",
+      merchant_id,
+      order_id: orderRef,
+      amount: Number(normalizeAmount(amount)),
+      currency_iso: "EUR",
+      description,
+      approve_url: process.env.PROCARD_APPROVE_URL,
+      decline_url: process.env.PROCARD_DECLINE_URL,
+      cancel_url: process.env.PROCARD_CANCEL_URL,
+      callback_url: process.env.PROCARD_CALLBACK_URL,
+      redirect: 0,
+      email: payload?.email || "",
+    };
+
+    reqBody.signature = makeRequestSignature({
+      merchant_id: reqBody.merchant_id,
+      order_id: reqBody.order_id,
+      amount: reqBody.amount,
+      currency_iso: reqBody.currency_iso,
+      description: reqBody.description,
+    });
+
     const res = await fetch(dispatcherUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -278,32 +222,24 @@ export const action = async ({ request }) => {
 
     const json = await res.json().catch(() => null);
 
-    console.log("DISPATCHER", { status: res.status, json });
-    if (!res.ok) {
-      console.error("Dispatcher error", { status: res.status, json });
-      return new Response("Dispatcher error", { status: 502 });
-    }
+    console.log("DISPATCHER RESPONSE:", json);
 
-    if (json?.result !== 0 || !json?.url) {
+    if (!res.ok || json?.result !== 0 || !json?.url) {
       console.error("Dispatcher rejected", json);
-      return new Response("OK", { status: 200 });
-      // console.error("Unexpected dispatcher response", json);
-      // return new Response("Bad dispatcher response", { status: 502 });
+      return new Response(null, { status: 200 });
     }
 
     const paymentUrl = String(json.url);
-
     const orderIdNumeric = Number(payload?.id);
-    await updateOrder(orderIdNumeric, paymentUrl);
 
-    const shop = session.shop; // p.sh. "erina-ks.com"
-    const accessToken = session.accessToken;
-
+    await updateOrder(shop, accessToken, orderIdNumeric, paymentUrl);
     await sendInvoiceEmail(shop, accessToken, orderIdNumeric);
-    console.log("UPDATED_ORDER", { orderIdNumeric, paymentUrl });
+
+    console.log("SUCCESS: invoice sent + order updated");
+
     return new Response(null, { status: 200 });
   } catch (e) {
-    console.error("Create payment link failed", e);
-    return new Response("Create payment link failed", { status: 502 });
+    console.error("Webhook error:", e);
+    return new Response(null, { status: 200 }); // NEVER 502
   }
 };
