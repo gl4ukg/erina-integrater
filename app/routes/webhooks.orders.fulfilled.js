@@ -170,7 +170,7 @@ export const action = async ({ request }) => {
       Openable: true,
       Fragile: false,
       Declared: false,
-      Exchangeable: true,
+      Exchangeable: false,
       Invoice: false,
       OrderPrice: orderPrice,
       OrderDescription: orderDescription || undefined,

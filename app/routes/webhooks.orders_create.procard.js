@@ -9,11 +9,20 @@ const API_VERSION = "2025-01";
 async function getOfflineAccessToken(shop) {
   const offlineId = `offline_${shop}`;
 
+  const found = await prisma.session.findMany({
+    take: 5,
+    select: { id: true },
+    orderBy: { id: "asc" },
+  });
+
+  console.log("SESSION_IDS_SAMPLE", found);
+
   const session = await prisma.session.findUnique({
     where: { id: offlineId },
     select: { accessToken: true },
   });
 
+  console.log("LOOKUP_OFFLINE", { offlineId, found: !!session });
   return session?.accessToken || null;
 }
 
