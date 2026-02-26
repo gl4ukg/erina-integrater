@@ -6,7 +6,9 @@ export const loader = async ({ request, params }) => {
 
   if (splat === "login") return login(request);
   if (splat === "callback") {
+    console.log("AUTH CALLBACK HIT");
     const result = await authenticate.admin(request);
+    console.log("AUTH CALLBACK RESULT:", result);
     if (result instanceof Response) return result;
     return new Response(null, { status: 302, headers: { Location: "/" } });
   }
