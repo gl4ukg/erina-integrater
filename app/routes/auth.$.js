@@ -5,10 +5,11 @@ export const loader = async ({ request, params }) => {
   console.log("AUTH HIT:", splat, request.url);
 
   if (splat === "login") return login(request);
-  if (splat === "callback") {
-    console.log("AUTH CALLBACK HIT");
+
+  // prano të dyja
+  if (splat === "callback" || splat === "shopify/callback") {
+    console.log("AUTH CALLBACK HIT:", splat);
     const result = await authenticate.admin(request);
-    console.log("AUTH CALLBACK RESULT:", result);
     if (result instanceof Response) return result;
     return new Response(null, { status: 302, headers: { Location: "/" } });
   }
