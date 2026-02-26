@@ -1,15 +1,11 @@
 import { authenticate, login } from "../shopify.server";
 
 export const loader = async ({ request, params }) => {
-  const splat = params["*"]; // "login" ose "shopify/callback" etj.
+  const splat = params["*"];
+  console.log("AUTH HIT:", splat, request.url);
 
-  console.log("AUTH ROUTE HIT:", splat, request.url);
-
-  if (splat === "login") {
-    return login(request);
-  }
-
-  if (splat === "shopify/callback") {
+  if (splat === "login") return login(request);
+  if (splat === "callback") {
     const result = await authenticate.admin(request);
     if (result instanceof Response) return result;
     return new Response(null, { status: 302, headers: { Location: "/" } });
