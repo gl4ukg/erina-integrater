@@ -108,19 +108,15 @@ async function shopifyRest(
 
 /* ---------------- UPDATE ORDER ---------------- */
 
-async function updateOrder(shop, accessToken, orderIdNumeric, paymentUrl) {
-  const current = await shopifyRest(
-    shop,
-    accessToken,
+async function updateOrder(orderIdNumeric, paymentUrl) {
+  const current = await shopifyRestWithStaticToken(
     `/orders/${orderIdNumeric}.json`,
   );
 
   const order = current?.order;
-
   const existing = Array.isArray(order?.note_attributes)
     ? order.note_attributes
     : [];
-
   const filtered = existing.filter((a) => a?.name !== "procard_payment_url");
 
   const note_attributes = [
@@ -129,7 +125,6 @@ async function updateOrder(shop, accessToken, orderIdNumeric, paymentUrl) {
   ];
 
   const tags = String(order?.tags || "");
-
   const nextTags = Array.from(
     new Set(
       tags
@@ -140,32 +135,57 @@ async function updateOrder(shop, accessToken, orderIdNumeric, paymentUrl) {
     ),
   ).join(", ");
 
-  await shopifyRest(shop, accessToken, `/orders/${orderIdNumeric}.json`, {
+  await shopifyRestWithStaticToken(`/orders/${orderIdNumeric}.json`, {
     method: "PUT",
-    body: {
-      order: {
-        id: orderIdNumeric,
-        tags: nextTags,
-        note_attributes,
-      },
-    },
+    body: { order: { id: orderIdNumeric, tags: nextTags, note_attributes } },
   });
 }
-
 /* ---------------- SEND INVOICE EMAIL ---------------- */
 
-async function sendInvoiceEmail(shop, accessToken, orderIdNumeric) {
-  await shopifyRest(
-    shop,
-    accessToken,
+async function sendInvoiceEmail(orderIdNumeric, email, paymentUrl) {
+  await shopifyRestWithStaticToken(
     `/orders/${orderIdNumeric}/send_invoice.json`,
     {
       method: "POST",
-      body: { invoice: {} },
+      body: {
+        invoice: {
+          to: email,
+          subject: "Payment link for your order",
+          custom_message: `Please pay using this link: ${paymentUrl}`,
+        },
+      },
     },
   );
 }
 
+async function shopifyRestWithStaticToken(path, { method = "GET", body } = {}) {
+  const shop = process.env.SHOPIFY_ADMIN_SHOP;
+  const token = process.env.SHOPIFY_ADMIN_TOKEN;
+  if (!shop || !token)
+    throw new Error("Missing SHOPIFY_ADMIN_SHOP / SHOPIFY_ADMIN_TOKEN");
+
+  const res = await fetch(`https://${shop}/admin/api/${API_VERSION}${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": token,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {}
+
+  if (!res.ok) {
+    console.error("Shopify REST error", { status: res.status, text, json });
+    throw new Error(`Shopify REST failed: ${res.status}`);
+  }
+
+  return json;
+}
 /* ---------------- MAIN ACTION ---------------- */
 
 export const action = async ({ request }) => {
@@ -241,8 +261,8 @@ export const action = async ({ request }) => {
     const paymentUrl = String(json.url);
     const orderIdNumeric = Number(payload?.id);
 
-    await updateOrder(shop, accessToken, orderIdNumeric, paymentUrl);
-    await sendInvoiceEmail(shop, accessToken, orderIdNumeric);
+    await updateOrder(orderIdNumeric, paymentUrl);
+    await sendInvoiceEmail(orderIdNumeric, payload?.email || "", paymentUrl);
 
     console.log("SUCCESS: invoice sent + order updated");
 
