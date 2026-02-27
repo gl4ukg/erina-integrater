@@ -170,11 +170,11 @@ async function updateOrder(orderIdNumeric, paymentUrl) {
 /* ---------------- EMAIL (RESEND) ---------------- */
 
 async function sendPaymentEmail(toEmail, paymentUrl, orderId) {
-  const key = process.env.RESEND_API_KEY;
+  const key = process.env.RE_SEND_API_KEY;
   const from = process.env.RESEND_EMAIL_FROM;
 
   if (!key || !from)
-    throw new Error("Missing RESEND_API_KEY / RESEND_EMAIL_FROM");
+    throw new Error("Missing RE_SEND_API_KEY / RESEND_EMAIL_FROM");
   if (!toEmail) {
     console.warn("No customer email on order; skipping Resend email");
     return;
