@@ -51,7 +51,7 @@ function isManualPayment(payload) {
   return names.includes("pay by card (email)") || names.includes("manual");
 }
 
-/* ---------------- SHOPIFY REST (STATIC TOKEN) ---------------- */
+/* ---------------- SHOPIFY ADMIN TOKEN (CLIENT CREDENTIALS) ---------------- */
 
 let cachedToken = null;
 let tokenExpiresAt = 0;
@@ -63,17 +63,17 @@ async function getAdminAccessToken() {
   const scopes = process.env.SHOPIFY_ADMIN_SCOPES;
 
   if (!shop || !clientId || !clientSecret || !scopes) {
-    throw new Error("Missing Shopify client credentials env vars");
+    throw new Error(
+      "Missing SHOPIFY_STORE_DOMAIN / SHOPIFY_API_KEY / SHOPIFY_API_SECRET / SHOPIFY_ADMIN_SCOPES",
+    );
   }
 
-  // Nëse token ekziston dhe s’ka skadu (23h buffer)
-  if (cachedToken && Date.now() < tokenExpiresAt) {
-    return cachedToken;
-  }
+  // Cache 23h
+  if (cachedToken && Date.now() < tokenExpiresAt) return cachedToken;
 
   const response = await fetch(`https://${shop}/admin/oauth/access_token`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({
       client_id: clientId,
       client_secret: clientSecret,
@@ -82,24 +82,24 @@ async function getAdminAccessToken() {
     }),
   });
 
-  const data = await response.json();
+  const data = await response.json().catch(() => null);
 
-  if (!response.ok) {
-    console.error("Token generation failed:", data);
+  if (!response.ok || !data?.access_token) {
+    console.error("Token generation failed:", {
+      status: response.status,
+      data,
+    });
     throw new Error("Failed to generate admin access token");
   }
 
   cachedToken = data.access_token;
-
-  // Shopify token zgjat 24h → ruajmë për 23h
   tokenExpiresAt = Date.now() + 23 * 60 * 60 * 1000;
 
   console.log("Generated new Admin API token");
-
   return cachedToken;
 }
 
-async function shopifyRestWithStaticToken(path, { method = "GET", body } = {}) {
+async function shopifyRest(path, { method = "GET", body } = {}) {
   const shop = process.env.SHOPIFY_STORE_DOMAIN;
   const token = await getAdminAccessToken();
 
@@ -120,19 +120,22 @@ async function shopifyRestWithStaticToken(path, { method = "GET", body } = {}) {
   } catch {}
 
   if (!res.ok) {
-    console.error("Shopify REST error", { status: res.status, text, json });
+    console.error("Shopify REST error", {
+      path,
+      status: res.status,
+      text,
+      json,
+    });
     throw new Error(`Shopify REST failed: ${res.status}`);
   }
 
   return json;
 }
 
-/* ---------------- UPDATE ORDER ---------------- */
+/* ---------------- UPDATE ORDER (TAGS + NOTE ATTRIBUTES) ---------------- */
 
 async function updateOrder(orderIdNumeric, paymentUrl) {
-  const current = await shopifyRestWithStaticToken(
-    `/orders/${orderIdNumeric}.json`,
-  );
+  const current = await shopifyRest(`/orders/${orderIdNumeric}.json`);
   const order = current?.order;
 
   const existing = Array.isArray(order?.note_attributes)
@@ -156,33 +159,66 @@ async function updateOrder(orderIdNumeric, paymentUrl) {
     ),
   ).join(", ");
 
-  await shopifyRestWithStaticToken(`/orders/${orderIdNumeric}.json`, {
+  await shopifyRest(`/orders/${orderIdNumeric}.json`, {
     method: "PUT",
     body: { order: { id: orderIdNumeric, tags: nextTags, note_attributes } },
   });
+
+  console.log("Order updated with tag + note attribute");
 }
 
-/* ---------------- SEND INVOICE EMAIL ---------------- */
+/* ---------------- EMAIL (RESEND) ---------------- */
 
-async function sendInvoiceEmail(orderIdNumeric, email, paymentUrl) {
-  if (!email) {
-    console.warn("No customer email on order; skipping send_invoice");
+async function sendPaymentEmail(toEmail, paymentUrl, orderId) {
+  const key = process.env.RESEND_API_KEY;
+  const from = process.env.RESEND_EMAIL_FROM;
+
+  if (!key || !from)
+    throw new Error("Missing RESEND_API_KEY / RESEND_EMAIL_FROM");
+  if (!toEmail) {
+    console.warn("No customer email on order; skipping Resend email");
     return;
   }
 
-  await shopifyRestWithStaticToken(
-    `/orders/${orderIdNumeric}/send_invoice.json`,
-    {
-      method: "POST",
-      body: {
-        invoice: {
-          to: email,
-          subject: "Payment link for your order",
-          custom_message: `Please pay using this link: ${paymentUrl}`,
-        },
-      },
+  const subject = `Erina Home – Payment link for order #${orderId}`;
+  const html = `
+    <div style="font-family: Inter, Arial, sans-serif; line-height: 1.5;">
+      <p>Hello,</p>
+      <p>Thanks for your order at <strong>Erina Home</strong>.</p>
+      <p>To complete your payment, please use this link:</p>
+      <p style="margin: 16px 0;">
+        <a href="${paymentUrl}" style="display:inline-block;padding:10px 14px;text-decoration:none;border-radius:8px;background:#13293D;color:#fff;">
+          Pay now
+        </a>
+      </p>
+      <p>Order: <strong>#${orderId}</strong></p>
+      <p>If you have any questions, reply to this email.</p>
+      <p>Best regards,<br/>Erina Home</p>
+    </div>
+  `;
+
+  const r = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${key}`,
     },
-  );
+    body: JSON.stringify({
+      from,
+      to: toEmail,
+      subject,
+      html,
+    }),
+  });
+
+  const data = await r.json().catch(() => null);
+
+  if (!r.ok) {
+    console.error("Resend error:", { status: r.status, data });
+    throw new Error(`Resend failed: ${r.status}`);
+  }
+
+  console.log("Resend email sent:", data?.id || "ok");
 }
 
 /* ---------------- MAIN ACTION ---------------- */
@@ -192,6 +228,7 @@ export const action = async ({ request }) => {
   console.log("WEBHOOK HIT:", topic);
 
   if (topic !== "ORDERS_CREATE") return new Response(null, { status: 200 });
+
   if (!isManualPayment(payload)) {
     console.log("Not manual payment → skip");
     return new Response(null, { status: 200 });
@@ -200,8 +237,10 @@ export const action = async ({ request }) => {
   try {
     const dispatcherUrl = process.env.PROCARD_DISPATCHER_URL;
     const merchant_id = process.env.PROCARD_MERCHANT_ID;
-    if (!dispatcherUrl || !merchant_id)
+
+    if (!dispatcherUrl || !merchant_id) {
       throw new Error("Missing PROCARD_DISPATCHER_URL / PROCARD_MERCHANT_ID");
+    }
 
     const orderRef = String(payload?.id || "");
     const amount = getOrderTotal(payload);
@@ -240,23 +279,23 @@ export const action = async ({ request }) => {
     console.log("DISPATCHER RESPONSE:", json);
 
     if (!res.ok || json?.result !== 0 || !json?.url) {
-      console.error("Dispatcher rejected", json);
+      console.error("Dispatcher rejected", { status: res.status, json });
       return new Response(null, { status: 200 });
     }
 
     const paymentUrl = String(json.url);
     const orderIdNumeric = Number(payload?.id);
-    console.log("UPDATING ORDER", orderIdNumeric);
-    console.log("SENDING INVOICE", orderIdNumeric);
+
     await updateOrder(orderIdNumeric, paymentUrl);
+
+    // Email dërgohet veç si bonus — mos e blloko webhook-un nëse dështon
     try {
-      console.log("UPDATING ORDER", orderIdNumeric);
-      console.log("SENDING INVOICE", orderIdNumeric);
-      await sendInvoiceEmail(orderIdNumeric, payload?.email || "", paymentUrl);
+      await sendPaymentEmail(payload?.email, paymentUrl, payload?.id);
     } catch (e) {
-      console.error("sendInvoiceEmail failed (non-fatal):", e);
+      console.error("sendPaymentEmail failed (non-fatal):", e);
     }
-    console.log("SUCCESS: invoice sent + order updated");
+
+    console.log("SUCCESS: order updated + payment email attempted");
     return new Response(null, { status: 200 });
   } catch (e) {
     console.error("Webhook error:", e);
