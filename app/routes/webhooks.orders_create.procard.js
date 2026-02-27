@@ -77,35 +77,6 @@ function isManualPayment(payload) {
 
 /* ---------------- SHOPIFY REST ---------------- */
 
-async function shopifyRest(
-  shop,
-  accessToken,
-  path,
-  { method = "GET", body } = {},
-) {
-  const res = await fetch(`https://${shop}/admin/api/${API_VERSION}${path}`, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": accessToken,
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-
-  const text = await res.text();
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {}
-
-  if (!res.ok) {
-    console.error("Shopify REST error", { status: res.status, text, json });
-    throw new Error(`Shopify REST failed: ${res.status}`);
-  }
-
-  return json;
-}
-
 /* ---------------- UPDATE ORDER ---------------- */
 
 async function updateOrder(orderIdNumeric, paymentUrl) {
@@ -161,6 +132,10 @@ async function sendInvoiceEmail(orderIdNumeric, email, paymentUrl) {
 async function shopifyRestWithStaticToken(path, { method = "GET", body } = {}) {
   const shop = process.env.SHOPIFY_ADMIN_SHOP;
   const token = process.env.SHOPIFY_ADMIN_TOKEN;
+
+  console.log("STATIC TOKEN SHOP:", shop);
+  console.log("STATIC TOKEN TOKEN:", token);
+
   if (!shop || !token)
     throw new Error("Missing SHOPIFY_ADMIN_SHOP / SHOPIFY_ADMIN_TOKEN");
 
@@ -206,13 +181,6 @@ export const action = async ({ request }) => {
   console.log("SHOP:", shop);
 
   try {
-    const accessToken = await getOfflineAccessToken(shop);
-
-    if (!accessToken) {
-      console.error("No offline token for shop:", shop);
-      return new Response(null, { status: 200 });
-    }
-
     const dispatcherUrl = process.env.PROCARD_DISPATCHER_URL;
     const merchant_id = process.env.PROCARD_MERCHANT_ID;
 
@@ -250,7 +218,6 @@ export const action = async ({ request }) => {
     });
 
     const json = await res.json().catch(() => null);
-
     console.log("DISPATCHER RESPONSE:", json);
 
     if (!res.ok || json?.result !== 0 || !json?.url) {
@@ -265,10 +232,9 @@ export const action = async ({ request }) => {
     await sendInvoiceEmail(orderIdNumeric, payload?.email || "", paymentUrl);
 
     console.log("SUCCESS: invoice sent + order updated");
-
     return new Response(null, { status: 200 });
   } catch (e) {
     console.error("Webhook error:", e);
-    return new Response(null, { status: 200 }); // NEVER 502
+    return new Response(null, { status: 200 });
   }
 };
