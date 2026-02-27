@@ -1,30 +1,7 @@
 import { authenticate } from "../shopify.server";
-import prisma from "../db.server";
 import crypto from "crypto";
 
 const API_VERSION = "2025-01";
-
-/* ---------------- TOKEN (Offline Session) ---------------- */
-
-async function getOfflineAccessToken(shop) {
-  const offlineId = `offline_${shop}`;
-
-  const found = await prisma.session.findMany({
-    take: 5,
-    select: { id: true },
-    orderBy: { id: "asc" },
-  });
-
-  console.log("SESSION_IDS_SAMPLE", found);
-
-  const session = await prisma.session.findUnique({
-    where: { id: offlineId },
-    select: { accessToken: true },
-  });
-
-  console.log("LOOKUP_OFFLINE", { offlineId, found: !!session });
-  return session?.accessToken || null;
-}
 
 /* ---------------- HELPERS ---------------- */
 
@@ -71,70 +48,18 @@ function isManualPayment(payload) {
   const names = (payload?.payment_gateway_names || []).map((x) =>
     String(x || "").toLowerCase(),
   );
-
   return names.includes("pay by card (email)") || names.includes("manual");
 }
 
-/* ---------------- SHOPIFY REST ---------------- */
-
-/* ---------------- UPDATE ORDER ---------------- */
-
-async function updateOrder(orderIdNumeric, paymentUrl) {
-  const current = await shopifyRestWithStaticToken(
-    `/orders/${orderIdNumeric}.json`,
-  );
-
-  const order = current?.order;
-  const existing = Array.isArray(order?.note_attributes)
-    ? order.note_attributes
-    : [];
-  const filtered = existing.filter((a) => a?.name !== "procard_payment_url");
-
-  const note_attributes = [
-    ...filtered,
-    { name: "procard_payment_url", value: paymentUrl },
-  ];
-
-  const tags = String(order?.tags || "");
-  const nextTags = Array.from(
-    new Set(
-      tags
-        .split(",")
-        .map((t) => t.trim())
-        .filter(Boolean)
-        .concat(["procard_link_sent"]),
-    ),
-  ).join(", ");
-
-  await shopifyRestWithStaticToken(`/orders/${orderIdNumeric}.json`, {
-    method: "PUT",
-    body: { order: { id: orderIdNumeric, tags: nextTags, note_attributes } },
-  });
-}
-/* ---------------- SEND INVOICE EMAIL ---------------- */
-
-async function sendInvoiceEmail(orderIdNumeric, email, paymentUrl) {
-  await shopifyRestWithStaticToken(
-    `/orders/${orderIdNumeric}/send_invoice.json`,
-    {
-      method: "POST",
-      body: {
-        invoice: {
-          to: email,
-          subject: "Payment link for your order",
-          custom_message: `Please pay using this link: ${paymentUrl}`,
-        },
-      },
-    },
-  );
-}
+/* ---------------- SHOPIFY REST (STATIC TOKEN) ---------------- */
 
 async function shopifyRestWithStaticToken(path, { method = "GET", body } = {}) {
   const shop = process.env.SHOPIFY_ADMIN_SHOP;
   const token = process.env.SHOPIFY_ADMIN_TOKEN;
 
+  // ✅ safe logs
   console.log("STATIC TOKEN SHOP:", shop);
-  console.log("STATIC TOKEN TOKEN:", token);
+  console.log("STATIC TOKEN PRESENT:", Boolean(token));
 
   if (!shop || !token)
     throw new Error("Missing SHOPIFY_ADMIN_SHOP / SHOPIFY_ADMIN_TOKEN");
@@ -161,28 +86,82 @@ async function shopifyRestWithStaticToken(path, { method = "GET", body } = {}) {
 
   return json;
 }
+
+/* ---------------- UPDATE ORDER ---------------- */
+
+async function updateOrder(orderIdNumeric, paymentUrl) {
+  const current = await shopifyRestWithStaticToken(
+    `/orders/${orderIdNumeric}.json`,
+  );
+  const order = current?.order;
+
+  const existing = Array.isArray(order?.note_attributes)
+    ? order.note_attributes
+    : [];
+  const filtered = existing.filter((a) => a?.name !== "procard_payment_url");
+
+  const note_attributes = [
+    ...filtered,
+    { name: "procard_payment_url", value: paymentUrl },
+  ];
+
+  const tags = String(order?.tags || "");
+  const nextTags = Array.from(
+    new Set(
+      tags
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean)
+        .concat(["procard_link_sent"]),
+    ),
+  ).join(", ");
+
+  await shopifyRestWithStaticToken(`/orders/${orderIdNumeric}.json`, {
+    method: "PUT",
+    body: { order: { id: orderIdNumeric, tags: nextTags, note_attributes } },
+  });
+}
+
+/* ---------------- SEND INVOICE EMAIL ---------------- */
+
+async function sendInvoiceEmail(orderIdNumeric, email, paymentUrl) {
+  if (!email) {
+    console.warn("No customer email on order; skipping send_invoice");
+    return;
+  }
+
+  await shopifyRestWithStaticToken(
+    `/orders/${orderIdNumeric}/send_invoice.json`,
+    {
+      method: "POST",
+      body: {
+        invoice: {
+          to: email,
+          subject: "Payment link for your order",
+          custom_message: `Please pay using this link: ${paymentUrl}`,
+        },
+      },
+    },
+  );
+}
+
 /* ---------------- MAIN ACTION ---------------- */
 
 export const action = async ({ request }) => {
   const { topic, payload } = await authenticate.webhook(request);
-
   console.log("WEBHOOK HIT:", topic);
 
-  if (topic !== "ORDERS_CREATE") {
-    return new Response(null, { status: 200 });
-  }
-
+  if (topic !== "ORDERS_CREATE") return new Response(null, { status: 200 });
   if (!isManualPayment(payload)) {
     console.log("Not manual payment → skip");
     return new Response(null, { status: 200 });
   }
 
-  const shop = request.headers.get("x-shopify-shop-domain");
-  console.log("SHOP:", shop);
-
   try {
     const dispatcherUrl = process.env.PROCARD_DISPATCHER_URL;
     const merchant_id = process.env.PROCARD_MERCHANT_ID;
+    if (!dispatcherUrl || !merchant_id)
+      throw new Error("Missing PROCARD_DISPATCHER_URL / PROCARD_MERCHANT_ID");
 
     const orderRef = String(payload?.id || "");
     const amount = getOrderTotal(payload);
