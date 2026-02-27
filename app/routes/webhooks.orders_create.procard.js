@@ -107,6 +107,7 @@ async function shopifyRestWithStaticToken(path, { method = "GET", body } = {}) {
     method,
     headers: {
       "Content-Type": "application/json",
+      Accept: "application/json",
       "X-Shopify-Access-Token": token,
     },
     body: body ? JSON.stringify(body) : undefined,
@@ -245,10 +246,16 @@ export const action = async ({ request }) => {
 
     const paymentUrl = String(json.url);
     const orderIdNumeric = Number(payload?.id);
-
+    console.log("UPDATING ORDER", orderIdNumeric);
+    console.log("SENDING INVOICE", orderIdNumeric);
     await updateOrder(orderIdNumeric, paymentUrl);
-    await sendInvoiceEmail(orderIdNumeric, payload?.email || "", paymentUrl);
-
+    try {
+      console.log("UPDATING ORDER", orderIdNumeric);
+      console.log("SENDING INVOICE", orderIdNumeric);
+      await sendInvoiceEmail(orderIdNumeric, payload?.email || "", paymentUrl);
+    } catch (e) {
+      console.error("sendInvoiceEmail failed (non-fatal):", e);
+    }
     console.log("SUCCESS: invoice sent + order updated");
     return new Response(null, { status: 200 });
   } catch (e) {
