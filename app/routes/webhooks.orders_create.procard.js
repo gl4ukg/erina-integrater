@@ -53,16 +53,55 @@ function isManualPayment(payload) {
 
 /* ---------------- SHOPIFY REST (STATIC TOKEN) ---------------- */
 
+let cachedToken = null;
+let tokenExpiresAt = 0;
+
+async function getAdminAccessToken() {
+  const shop = process.env.SHOPIFY_STORE_DOMAIN;
+  const clientId = process.env.SHOPIFY_API_KEY;
+  const clientSecret = process.env.SHOPIFY_API_SECRET;
+  const scopes = process.env.SHOPIFY_ADMIN_SCOPES;
+
+  if (!shop || !clientId || !clientSecret || !scopes) {
+    throw new Error("Missing Shopify client credentials env vars");
+  }
+
+  // Nëse token ekziston dhe s’ka skadu (23h buffer)
+  if (cachedToken && Date.now() < tokenExpiresAt) {
+    return cachedToken;
+  }
+
+  const response = await fetch(`https://${shop}/admin/oauth/access_token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: clientId,
+      client_secret: clientSecret,
+      grant_type: "client_credentials",
+      scope: scopes,
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    console.error("Token generation failed:", data);
+    throw new Error("Failed to generate admin access token");
+  }
+
+  cachedToken = data.access_token;
+
+  // Shopify token zgjat 24h → ruajmë për 23h
+  tokenExpiresAt = Date.now() + 23 * 60 * 60 * 1000;
+
+  console.log("Generated new Admin API token");
+
+  return cachedToken;
+}
+
 async function shopifyRestWithStaticToken(path, { method = "GET", body } = {}) {
-  const shop = process.env.SHOPIFY_ADMIN_SHOP;
-  const token = process.env.SHOPIFY_ADMIN_TOKEN;
-
-  // ✅ safe logs
-  console.log("STATIC TOKEN SHOP:", shop);
-  console.log("STATIC TOKEN PRESENT:", Boolean(token));
-
-  if (!shop || !token)
-    throw new Error("Missing SHOPIFY_ADMIN_SHOP / SHOPIFY_ADMIN_TOKEN");
+  const shop = process.env.SHOPIFY_STORE_DOMAIN;
+  const token = await getAdminAccessToken();
 
   const res = await fetch(`https://${shop}/admin/api/${API_VERSION}${path}`, {
     method,
