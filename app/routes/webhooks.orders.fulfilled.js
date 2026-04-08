@@ -5,6 +5,26 @@ function normalizeCityLabel(city) {
   return String(city).trim();
 }
 
+function normalizedPhoneForCountryDetection(phone) {
+  if (!phone) return "";
+  return String(phone).replace(/[^\d+]/g, "");
+}
+
+function countryIdFromPhone(phone) {
+  const normalizedPhone = normalizedPhoneForCountryDetection(phone);
+  if (!normalizedPhone) return null;
+
+  // International and local dialing prefixes for supported countries.
+  if (normalizedPhone.startsWith("+355") || normalizedPhone.startsWith("00355"))
+    return 2; // Albania
+  if (normalizedPhone.startsWith("+383") || normalizedPhone.startsWith("00383"))
+    return 1; // Kosovo
+  if (normalizedPhone.startsWith("+383") || normalizedPhone.startsWith("00383"))
+    return 3; // North Macedonia
+
+  return null;
+}
+
 async function postJsonWithRedirects(url, { headers, body, maxRedirects = 3 }) {
   let currentUrl = url;
 
@@ -37,7 +57,7 @@ async function postJsonWithRedirects(url, { headers, body, maxRedirects = 3 }) {
   throw new Error("Too many redirects");
 }
 
-function countryIdFromShippingAddress(shippingAddress) {
+function countryIdFromShippingAddress(shippingAddress, phone) {
   const code = (
     shippingAddress?.country_code ||
     shippingAddress?.countryCodeV2 ||
@@ -58,6 +78,9 @@ function countryIdFromShippingAddress(shippingAddress) {
     code === "MACEDONIA"
   )
     return 3;
+
+  const byPhone = countryIdFromPhone(phone);
+  if (byPhone) return byPhone;
 
   return 1;
 }
@@ -135,7 +158,7 @@ export const action = async ({ request }) => {
   const phone = shipping?.phone || payload?.phone || "";
 
   const cityLabel = normalizeCityLabel(shipping?.city);
-  const countryId = countryIdFromShippingAddress(shipping);
+  const countryId = countryIdFromShippingAddress(shipping, phone);
 
   const width = parseNumberOr(process.env.POSTOFFICE_DEFAULT_WIDTH_CM, 20);
   const length = parseNumberOr(process.env.POSTOFFICE_DEFAULT_LENGTH_CM, 20);
